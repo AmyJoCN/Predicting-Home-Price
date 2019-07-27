@@ -1,0 +1,597 @@
+---
+title: "AmyChamberlain-FinalProj"
+always_allow_html: yes
+output: word_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries, set seed, set data file
+
+```{r libraries}
+library(corrgram)
+library(randomForest)
+library(GGally)
+library(caret)
+library(tidyverse)
+library(ggplot2)
+library(reshape)
+
+set.seed(1234)
+```
+
+```{r setwd}
+setwd("/Users/cocoapuffs/Desktop/UW Data Analytics/Course 3/Final Project")
+
+file = 'kc_house_data.csv'
+```
+
+## Load dataset & remove ID
+
+```{r load data}
+house_raw = read_csv(file)
+
+house_raw$id <- NULL
+
+summary(house_raw)
+glimpse(house_raw)
+```
+
+## Data exploration through ggpairs and corr plots of the variables
+
+```{r ggpairs}
+ggpairs(house_raw[,c(3:6,2)])
+
+ggpairs(house_raw[,c(7:11,2)])
+
+ggpairs(house_raw[,c(12:15,2)])
+
+ggpairs(house_raw[,c(16:20,2)])
+```
+
+```{r corr plot}
+library(corrplot)
+
+corrMatrix <- cor(house_raw[,c(2:20)])
+head(round(corrMatrix,2))
+
+title <- "Correlation Plot of Variables to Price"
+corrplot(corrMatrix, method="circle", title=title, mar=c(0,0,.5,0))
+```
+
+## Evaluating variable correlation
+
+```{r correlationMatrix}
+cor_level <- .7
+correlationMatrix <- cor(house_raw[,c(2:20)])
+cor_melt <- arrange(melt(correlationMatrix), desc(value), X2)
+
+View(cor_melt)
+
+dplyr::filter(cor_melt, row_number() %% 2 == 1 & value != 1.0, value > cor_level)
+
+cor_level <- .5
+dplyr::filter(cor_melt, row_number() %% 2 == 1 & value != 1.0, X2 == 'price', value > cor_level)
+```
+
+### Removing variables that don't contribute to a good model
+Sqft_living15, sqft_lot15, and sqft_above are being removed as they are colinear to sqft_living. Sqft_basement and waterfront are also being removed as there are few observations(houses) that are on the waterfront or have basements. Zipcode is not needed as we have location represented by latitude and longitude variables.
+
+```{r house}
+house <- house_raw %>% select(-sqft_living15, -sqft_lot15, -sqft_above, -waterfront, -zipcode, -sqft_basement)
+
+glimpse(house)
+```
+
+## Further data exploration and wrangling
+
+```{r log price, sqft_living, sqft_lot}
+#house_log is data with log variables added
+
+house_log <- house
+
+house_log$log_price = log10(house$price + 1)
+house_log$log_sqft_living = log10(house$sqft_living + 1)
+house_log$log_sqft_lot = log10(house$sqft_lot + 1)
+
+glimpse(house_log)
+```
+
+Explored the distribution of house sales on a web map of King County.
+
+```{r map view}
+library(sf)
+library(mapview)
+
+house_sf <- st_as_sf(house_log, coords = c("long", "lat"), crs = 4326)
+mapview(house_sf)
+
+#map plot opens up in web browser
+```
+
+Due to most houses not having views, it made more sense to binarize this variable into no view (0) or view (1).
+
+```{r transform view into n/y (0/1)}
+#house_mod is now dataset with the transformed variables and new features added
+house_mod <- house_log
+
+house_mod$view= ifelse(house_mod$view != '0', '1', '0')
+house_mod <- house_mod %>% mutate(view = as.factor(view))
+
+summary(house_mod)
+```
+
+I removed about 10 observations where bathroom was '0'- I am skeptical these houses actually did not have bathrooms.
+
+```{r remove observations with 0 bathrooms}
+house_bthrm <- house_mod %>% 
+  group_by(bathrooms) %>%
+  summarize(n = n())
+house_bthrm
+
+house_mod <- filter(house_mod, bathrooms != 0)
+summary(house_mod)
+```
+
+I changed the dttm variable to a date data type and created a new month variable that grouped the sales into each of the 13 months of the data set.
+
+```{r date transformation}
+library(lubridate)
+
+house_mod$dttm = house_mod$date
+house_mod <- house_mod %>% mutate(date = as_date(date))
+
+glimpse(house_mod)
+```
+
+```{r create month variable}
+#house_month new dataset with month variable added
+
+house_month <- house_mod
+
+house_month$month = ifelse(str_detect(house_month$date, "^2014-05"), 'May14', 
+              ifelse(str_detect(house_month$date, "^2014-06"), 'Jun14', 
+              ifelse(str_detect(house_month$date, "^2014-07"), 'Jul14',
+              ifelse(str_detect(house_month$date, "^2014-08"), 'Aug14',
+              ifelse(str_detect(house_month$date, "^2014-09"), 'Sep14',
+              ifelse(str_detect(house_month$date, "^2014-10"), 'Oct14',
+              ifelse(str_detect(house_month$date, "^2014-11"), 'Nov14',
+              ifelse(str_detect(house_month$date, "^2014-12"), 'Dec14',
+              ifelse(str_detect(house_month$date, "^2015-01"), 'Jan15',
+              ifelse(str_detect(house_month$date, "^2015-02"), 'Feb15',
+              ifelse(str_detect(house_month$date, "^2015-03"), 'Mar15',
+              ifelse(str_detect(house_month$date, "^2015-04"), 'Apr15',
+              'May15'))))))))))))
+
+house_month$month = factor(house_month$month,
+                  levels = c('May14', 'Jun14', 'Jul14', 'Aug14', 'Sep14', 'Oct14',
+                             'Nov14', 'Dec14', 'Jan15', 'Feb15', 'Mar15', 'Apr15', 'May15'
+                  ))
+glimpse(house_month)
+```
+
+I wanted to better explore any trends by month by comparing sales number to the median sales price, so I created a stacked dot/line and bar plot. In the plot, the median price and count of sales follow a similar trend, and even here we can see some seasonality effect, where sales and price are down in the colder months and pick back up in the Spring. We would need to pull in other data to determine what else might be affecting trends in price and sales volume.
+
+```{r count and median by month}
+house_date <- house_month %>% 
+  group_by(month) %>%
+  summarize(n = n(),
+            price_median = median(price))
+house_date
+```
+
+```{r Stacked plot median price and count by month}
+d <- ggplot(house_month, aes(month))
+p1 <- d + stat_summary_bin(aes(y = price), fun.y = "median", geom = "point", color="steelblue4", size=2.5) + 
+  stat_summary_bin(aes(y = price, group=1), fun.y = "median", geom = "line", color="cornflowerblue", size=1) + 
+  theme_minimal() + 
+  theme(plot.title = element_text(size=25, face="bold", hjust = .5, vjust = .5),
+        axis.title.y = element_text(size=14, face="bold"),
+        axis.text.y = element_text(size = 12)) +
+      theme(axis.title.x = element_blank(), axis.text.x = element_blank()) + 
+  ggtitle("House Sales: Median Price and Count by Month") +
+  ylab("Price")
+
+p2 <- ggplot(house_month, aes(x = month)) +
+  geom_bar(fill="steelblue4", color="cornflowerblue", size=.8) +
+  theme_minimal() +
+  xlab("Month") +
+  ylab("Count") +
+  theme(axis.title.x = element_text(size=14, face="bold"),
+        axis.title.y = element_text(size=14, face="bold"),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12))
+
+library(grid)
+grid.newpage()
+grid.draw(rbind(ggplotGrob(p1), ggplotGrob(p2), size = "last"))
+```
+
+Here I am adding the new month variable to the dataset, and creating new iterations as I go along when changes/transformations are incorporated.
+
+```{r modelmatrix and cbind month}
+month = model.matrix(~ month - 1, data = house_month)
+
+house_bind = cbind(house_month, month)
+
+glimpse(house_bind)
+```
+
+The original date variables as well as the original variables I performed logged transformations on are being removed in a dataset I am using to build my train and test sets for modeling.
+
+```{r removing addl vars to exclude in models}
+#new dataset for modeling, house_model, deselecting original unmodified variables
+house_model <- house_bind %>% select(-date, -dttm, -month, -price, -sqft_living, -sqft_lot)
+
+glimpse(house_model)
+summary(house_model)
+```
+
+## Splitting dataset into train and test sets.
+
+```{r split into train and test sets}
+in_train = createDataPartition(y = house_model$log_price,
+                               p = 0.80,
+                               list = FALSE)
+
+house_train = house_model[in_train, ]
+house_test = house_model[-in_train, ]
+```
+
+```{r NZV}
+#identify any vars w/near zero variance with nearZeroVar
+nearZeroVar(house_model, saveMetrics = TRUE)
+
+```
+
+## Incorporating preprocessing into our train and test sets.
+
+```{r preprocessing}
+preprocess_steps = preProcess(select(house_train, bedrooms, bathrooms, floors, condition, grade, yr_built, log_sqft_living, log_sqft_lot, condition, grade, yr_built, yr_renovated, lat, long), method=c("center", "scale", "nzv"))
+
+house_train_proc = predict(preprocess_steps, newdata = house_train)
+house_test_proc = predict(preprocess_steps, newdata = house_test)
+
+glimpse(house_train_proc)
+glimpse(house_test_proc)
+```
+
+The non-zero variance method removed yr_renovated along with binary month variables monthJan15 and monthMay15.
+
+## Building a full linear model.
+
+```{r train full linear model}
+lm_full_model = train(log_price ~ ., 
+                 data = house_train_proc,
+                 method = "lm", 
+                 trControl = trainControl(method = "cv", number = 10))
+
+summary(lm_full_model) # some more info on final model
+summary(lm_full_model$finalModel)
+```
+
+Applying the full linear model on the test set, getting predictions and errors.
+
+```{r predict on test, view RMSE, errors}
+# Predict on Test
+predictions_lmfull = predict(lm_full_model, newdata = house_test_proc)
+
+# view the metric RMSE
+postResample(pred = predictions_lmfull, obs = house_test_proc$log_price)
+
+# manual way of getting errors
+errors_lmfull = data.frame(pred = predictions_lmfull, 
+                    obs = house_test_proc$log_price,
+                    error = predictions_lmfull - house_test_proc$log_price)
+```
+
+Plotting errors and variable importance for full linear model.
+
+```{r plotting errors plots and var importance}
+
+ggplot(data = errors_lmfull, aes(x = pred, y = obs)) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  xlim(5,7) +
+  ylim(5,7) +
+  labs(title="Full Linear Model - Predicted vs. Observed Scores")
+
+plot(errors_lmfull$error, main="Full Linear Model Errors Plot")
+
+plot(varImp(lm_full_model), main="Full Linear Model Variable Importance Plot")
+```
+
+The log of sqr_lot, longitude, and all month binary variables were not found to be important to the model. In the next model, I will remove variables with low importance.
+
+
+## Revised linear model removing variables with low importance
+
+```{r lm_rev_model}
+
+lm_rev_model = train(log_price ~ lat + grade + log_sqft_living + yr_built + view + condition + bathrooms + 
+                       floors + bedrooms, 
+                 data = house_train_proc,
+                 method = "lm", 
+                 trControl = trainControl(method = "cv", number = 10))
+
+summary(lm_rev_model)
+summary(lm_rev_model$finalModel)
+
+```
+
+
+```{r lm_rev_model preds and errors}
+
+predictions_lm_rev = predict(lm_rev_model, newdata = house_test_proc)
+
+postResample(pred = predictions_lm_rev, obs = house_test_proc$log_price)
+
+errors_lm_rev = data.frame(pred = predictions_lm_rev, 
+                    obs = house_test_proc$log_price,
+                    error = predictions_lm_rev - house_test_proc$log_price)
+```
+
+```{r lm_rev_model plots}
+ggplot(data = errors_lm_rev, aes(x = pred, y = obs)) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  xlim(5,7) +
+  ylim(5,7) +
+  labs(title="Revised Linear Model - Predicted vs. Observed Scores")
+
+plot(errors_lm_rev$error, main="Revised Linear Model Errors Plot")
+
+plot(varImp(lm_rev_model), main="Revised Linear Model Variable Importance Plot")
+```
+
+## Revised linear model again to include both variables with more importance and those included in prediction criteria.
+
+```{r lm_rev_model2 train}
+lm_rev_model2 = train(log_price ~ lat + grade + bedrooms + log_sqft_living + bathrooms + log_sqft_lot + 
+                        condition + yr_built + view + floors,
+                 data = house_train_proc,
+                 method = "lm", 
+                 trControl = trainControl(method = "cv", number = 10))
+
+summary(lm_rev_model2)
+summary(lm_rev_model2$finalModel)
+
+```
+
+```{r lm_rev_model2 preds and errors}
+predictions_lm_rev_model2 = predict(lm_rev_model2, newdata = house_test_proc)
+
+postResample(pred = predictions_lm_rev_model2, obs = house_test_proc$log_price)
+
+errors_lm_rev_model2 = data.frame(pred = predictions_lm_rev_model2, 
+                    obs = house_test_proc$log_price,
+                    error = predictions_lm_rev_model2 - house_test_proc$log_price)
+```
+
+```{r lm_rev_model2 plots}
+ggplot(data = errors_lm_rev_model2, aes(x = pred, y = obs)) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  xlim(5,7) +
+  ylim(5,7) +  
+  labs(title="Revised Linear Model w/Criteria - Predicted vs. Observed Scores")
+
+plot(errors_lm_rev_model2$error, main="Revised Linear Model w/Criteria Errors Plot")
+
+plot(varImp(lm_rev_model2, main="Revised Linear Model w/Criteria Variable Importance Plot"))
+```
+
+## Training a final linear model including only the variables in the criteria.
+
+```{r lm_fin_model}
+lm_fin_model = train(log_price ~ bedrooms + bathrooms + log_sqft_living + log_sqft_lot + condition +
+                       grade + yr_built,
+                 data = house_train_proc,
+                 method = "lm", 
+                 trControl = trainControl(method = "cv", number = 10))
+
+summary(lm_fin_model)
+summary(lm_fin_model$finalModel)
+
+```
+
+```{r lm_fin_model preds and errors}
+predictions_lm_fin_model = predict(lm_fin_model, newdata = house_test_proc)
+
+postResample(pred = predictions_lm_fin_model, obs = house_test_proc$log_price)
+
+errors_lm_fin_model = data.frame(pred = predictions_lm_fin_model, 
+                    obs = house_test_proc$log_price,
+                    error = predictions_lm_fin_model - house_test_proc$log_price)
+```
+
+```{r lm_fin_model plots}
+ggplot(data = errors_lm_fin_model, aes(x = pred, y = obs)) +
+  geom_point() + 
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  xlim(5,7) +
+  ylim(5,7) +  
+  labs(title="Final Linear Model w/Criteria Only - Predicted vs. Observed Scores")
+
+plot(errors_lm_fin_model$error, main="Final Linear Model w/Criteria Only Errors Plot")
+
+plot(varImp(lm_fin_model, main="Final Linear Model w/Criteria Only Variable Importance Plot"))
+```
+
+## Comparing the four linear models across their RMSE, Rsquared and MAE scores to determine best predictive model.
+
+```{r linear model comparison}
+results = resamples(list(Full_model = lm_full_model, Importance_model = lm_rev_model,
+                         Revised_model = lm_rev_model2, Criteria_model = lm_fin_model))
+
+dotplot(results, main="Linear Model Comparison")
+```
+
+It appears the model containing only the variables representing the given prediction criteria performed the worst of the four linear models, with the other three models performing extremely similarly, each at .76 Rsquared and .112 RMSE. 
+
+##Random Forest Model
+
+Here I am constructing a Random Forest model based on the variables used in the revised linear model which included all of the variables most important to the model plus any other given criteria variables.
+
+```{r RF model}
+train_control<- trainControl(method="cv", number=3, savePredictions = TRUE)
+rf_model <- train(log_price ~ lat + grade + bedrooms + log_sqft_living + bathrooms + log_sqft_lot + 
+                        condition + yr_built + view + floors, 
+                  data=house_train_proc, trControl=train_control, method="rf")
+
+rf_model
+```
+
+```{r RF predictions and errors}
+predictions_rf = predict(rf_model, newdata = house_test_proc)
+
+postResample(pred = predictions_rf, obs = house_test_proc$log_price)
+
+errors_rf= data.frame(pred = predictions_rf, 
+                    obs = house_test_proc$log_price,
+                    error = predictions_rf - house_test_proc$log_price)
+
+```
+
+```{r RF plots}
+plot(errors_rf$error, main="RF Model Errors Plot")
+
+plot(rf_model, main="Plot of RF model")
+plot(rf_model$finalModel, main="Plot of Final RF model")
+```
+
+
+In the second RandomForest model I will include only the given prediction criteria.
+
+```{r revised rf_model}
+train_control<- trainControl(method="cv", number=3, savePredictions = TRUE)
+rf_model_crit<- train(log_price ~ bedrooms + bathrooms + log_sqft_living + log_sqft_lot + condition +
+                       grade + yr_built,
+                      data=house_train_proc, trControl=train_control, method="rf")
+rf_model_crit
+```
+
+```{r revised rf_model preds and errors}
+predictions_rf_crit = predict(rf_model_crit, newdata = house_test_proc)
+
+postResample(pred = predictions_rf_crit, obs = house_test_proc$log_price)
+
+errors_rf_crit= data.frame(pred = predictions_rf_crit, 
+                    obs = house_test_proc$log_price,
+                    error = predictions_rf_crit - house_test_proc$log_price)
+```
+
+```{r revised rf_model plots}
+plot(errors_rf_crit$error, main="RF Criteria Model Errors Plot")
+
+plot(rf_model_crit, main="Plot of RF Criteria Model")
+plot(rf_model_crit$finalModel, main="Plot of Final RF Criteria Model")
+```
+
+# Comparing the RF model performance metrics.
+
+```{r RF model comparison}
+RF_model_comp <- postResample(pred = predictions_rf, obs = house_test_proc$log_price)
+RF_rev_comp <- postResample(pred = predictions_rf_crit, obs = house_test_proc$log_price)
+
+RF_model_comp
+RF_rev_comp
+```
+
+As we saw in the linear models, the model with only the given predicted criteria included did not perform as well as when it had included the variables that were shown to have importance in prevous models. Thus far, out of the random forest and linear models, the first RF model performed much better than the linear models at .885 Rsquared and .0778 RMSE.
+
+
+## Predicting home price with given criteria.
+
+```{r new dataset with criteria}
+house_predict <- house_model
+
+to_predict <- house_predict[0,]
+to_predict[1,]$bedrooms <- 4
+to_predict[1,]$bathrooms <- 3
+to_predict[1,]$log_sqft_living <- log10(4000)
+to_predict[1,]$log_sqft_lot <- log10(5000)
+to_predict[1,]$condition <- 5
+to_predict[1,]$grade <- 13
+to_predict[1,]$yr_built <- 2015
+
+glimpse(to_predict)
+```
+
+```{r apply processing to new dataset}
+pred_process_steps <- preProcess(select(house_predict, bedrooms, bathrooms, log_sqft_living, log_sqft_lot,
+                                        condition, grade, yr_built), 
+                                 method=c("center", "scale", "nzv"))
+
+to_predict <- predict(pred_process_steps, newdata = to_predict)
+
+#str function to view dataset var data types
+View(to_predict)
+str(to_predict)
+```
+
+```{r make prediction and reverse log for predicted home price}
+antilog<-function(lx,base)    {
+  lbx<-lx/log(exp(1),base=base)    
+  result<-exp(lbx)    
+  result    
+  }  
+
+prediction <- predict(rf_model_crit, newdata = to_predict)
+
+antilog(prediction,10)
+```
+
+Price of home predicted in model with given criteria only is $611,538.20
+
+
+# Prediction with given criteria plus other variables shown to have importance in the best performing model(s).
+
+```{r second pred criteria}
+house_predict <- house_model
+
+to_predict <- house_predict[0,]
+to_predict[1,]$bedrooms <- 4
+to_predict[1,]$bathrooms <- 3
+to_predict[1,]$log_sqft_living <- log10(4000)
+to_predict[1,]$log_sqft_lot <- log10(5000)
+to_predict[1,]$condition <- 5
+to_predict[1,]$grade <- 7
+to_predict[1,]$yr_built <- 2004
+to_predict[1,]$lat <- 47.5667
+to_predict[1,]$view <- 0
+to_predict[1,]$floors <- 2
+
+glimpse(to_predict)
+```
+
+```{r second pred preprocess}
+pred_process_steps <- preProcess(select(house_predict, lat, grade, bedrooms, log_sqft_living, bathrooms,  
+                                          log_sqft_lot, condition, yr_built, view, floors), 
+                                 method=c("center", "scale", "nzv"))
+
+to_predict <- predict(pred_process_steps, newdata = to_predict)
+
+#str function to view dataset var data types
+View(to_predict)
+str(to_predict)
+```
+
+```{r second prediction}
+antilog<-function(lx,base)    {
+  lbx<-lx/log(exp(1),base=base)    
+  result<-exp(lbx)    
+  result    
+  }  
+
+prediction <- predict(rf_model, newdata = to_predict)
+
+antilog(prediction,10)
+```
+
+The predicted home price returned by the model that included the criteria with the addition of variables shown to have more importance to the earlier models returned a much higher value, over twice as high! $1,332,614.
+
